@@ -1,0 +1,9 @@
+certifi==2023.7.22        # Latest secure version
+chardet==5.1.0            # Updated to the latest stable release
+datadog==0.44.0           # Newer version with Python 3.8 support
+decorator==5.1.1          # Updated to the latest release
+idna==3.4                 # Newer, secure version
+requests==2.31.0          # Latest stable release
+simplejson==3.19.1        # Newer version with bug fixes
+urllib3==1.26.16          # Latest secure version
+pytz==2023.3              # Latest version of timezone library

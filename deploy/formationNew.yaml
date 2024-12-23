@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Bucket Antivirus Quickstart Template (LambdaAVScanner Only)
+
+Parameters:
+  SourceBucket:
+    Type: String
+    Description: Name of the source bucket whose objects will be scanned. If more than one source bucket, the others will have to be manually added to the AV Scanner Policy after creation.
+    Default: "<source-bucket>"
+    AllowedPattern: ".+"
+
+Resources:
+  # IAM Role for the Scanner Lambda Function
+  IamRoleAVScanner:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: AVScannerLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Tags:
+        - Key: Service
+          Value: bucket-antivirus
+
+  # IAM Policy for the Scanner Lambda Function
+  IamPolicyAVScanner:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: AVScannerLambdaPolicy
+      Roles:
+        - !Ref IamRoleAVScanner
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: WriteCloudWatchLogs
+            Effect: Allow
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: "*"
+          - Sid: S3AVScan
+            Effect: Allow
+            Action:
+              - "s3:GetObject"
+              - "s3:GetObjectTagging"
+              - "s3:GetObjectVersion"
+              - "s3:PutObjectTagging"
+              - "s3:PutObjectVersionTagging"
+            Resource:
+              - !Sub [
+                  "arn:aws:s3:::${SourceBucketName}/*",
+                  { SourceBucketName: !Ref SourceBucket },
+                ]
+          - Sid: KmsDecrypt
+            Effect: Allow
+            Action:
+              - "kms:Decrypt"
+            Resource:
+              - !Sub [
+                  "arn:aws:s3:::${SourceBucketName}/*",
+                  { SourceBucketName: !Ref SourceBucket },
+                ]
+          - Sid: S3HeadObject
+            Effect: Allow
+            Action:
+              - "s3:ListBucket"
+            Resource:
+              - !Sub [
+                  "arn:aws:s3:::${SourceBucketName}/*",
+                  { SourceBucketName: !Ref SourceBucket },
+                ]
+              - !Sub [
+                  "arn:aws:s3:::${SourceBucketName}",
+                  { SourceBucketName: !Ref SourceBucket },
+                ]
+
+  # Lambda Function for Scanning
+  LambdaAVScanner:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: avScanner
+      Description: LambdaFunction to scan newly uploaded objects in S3.
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              return {
+                  'statusCode': 200, 'body': json.dumps('Hello from Lambda!')
+              }
+      Handler: "scan.lambda_handler"
+      MemorySize: 1500
+      Timeout: 300
+      Role: !GetAtt [IamRoleAVScanner, Arn]
+      Environment:
+        Variables:
+          AV_DEFINITION_S3_BUCKET: !Ref SourceBucket
+      Tags:
+        - Key: Service
+          Value: bucket-antivirus
+
+Outputs:
+  LambdaAVScanner:
+    Value: !Ref LambdaAVScanner
+    Description: Lambda function to scan newly created S3 objects
+
+  IamRoleAVScanner:
+    Value: !Ref IamRoleAVScanner
+    Description: IAM Role used by the Lambda Scanner function. Edit its policy to add/change source S3 buckets.
