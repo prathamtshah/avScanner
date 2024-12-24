@@ -14,70 +14,19 @@
 # limitations under the License.
 
 import base64
-import copy
 import json
 import os
-from urllib.parse import unquote_plus
 from distutils.util import strtobool
 
 import boto3
 
 import clamav
-import metrics
 from common import AV_DEFINITION_S3_BUCKET
 from common import AV_DEFINITION_S3_PREFIX
-from common import AV_DELETE_INFECTED_FILES
 from common import AV_PROCESS_ORIGINAL_VERSION_ONLY
-from common import AV_SCAN_START_METADATA
-from common import AV_SCAN_START_SNS_ARN
-from common import AV_SIGNATURE_METADATA
-from common import AV_STATUS_CLEAN
-from common import AV_STATUS_INFECTED
-from common import AV_STATUS_METADATA
-from common import AV_STATUS_SNS_ARN
-from common import AV_STATUS_SNS_PUBLISH_CLEAN
-from common import AV_STATUS_SNS_PUBLISH_INFECTED
-from common import AV_TIMESTAMP_METADATA
-from common import SNS_ENDPOINT
 from common import S3_ENDPOINT
 from common import create_dir
 from common import get_timestamp
-
-
-def event_object(event, event_source="s3"):
-
-    # SNS events are slightly different
-    if event_source.upper() == "SNS":
-        event = json.loads(event["Records"][0]["Sns"]["Message"])
-
-    # Break down the record
-    records = event["Records"]
-    if len(records) == 0:
-        raise Exception("No records found in event!")
-    record = records[0]
-
-    s3_obj = record["s3"]
-
-    # Get the bucket name
-    if "bucket" not in s3_obj:
-        raise Exception("No bucket found in event!")
-    bucket_name = s3_obj["bucket"].get("name", None)
-
-    # Get the key name
-    if "object" not in s3_obj:
-        raise Exception("No key found in event!")
-    key_name = s3_obj["object"].get("key", None)
-
-    if key_name:
-        key_name = unquote_plus(key_name)
-
-    # Ensure both bucket and key exist
-    if (not bucket_name) or (not key_name):
-        raise Exception("Unable to retrieve object from event.\n{}".format(event))
-
-    # Create and return the object
-    s3 = boto3.resource("s3", endpoint_url=S3_ENDPOINT)
-    return s3.Object(bucket_name, key_name)
 
 
 def verify_s3_object_version(s3, s3_object):
@@ -105,128 +54,88 @@ def get_local_path(s3_object, local_prefix):
     return os.path.join(local_prefix, s3_object.bucket_name, s3_object.key)
 
 
-def delete_s3_object(s3_object):
-    try:
-        s3_object.delete()
-    except Exception:
-        raise Exception(
-            "Failed to delete infected file: %s.%s"
-            % (s3_object.bucket_name, s3_object.key)
-        )
-    else:
-        print("Infected file deleted: %s.%s" % (s3_object.bucket_name, s3_object.key))
 
+# Define allowed content types and their corresponding magic bytes
+ALLOWED_CONTENT_TYPES = {
+    "image/jpeg": [0xFF, 0xD8, 0xFF],
+    "image/png": [0x89, 0x50, 0x4E, 0x47],
+    "application/pdf": [0x25, 0x50, 0x44, 0x46],
+}
 
-def set_av_metadata(s3_object, scan_result, scan_signature, timestamp):
-    content_type = s3_object.content_type
-    metadata = s3_object.metadata
-    metadata[AV_SIGNATURE_METADATA] = scan_signature
-    metadata[AV_STATUS_METADATA] = scan_result
-    metadata[AV_TIMESTAMP_METADATA] = timestamp
-    s3_object.copy(
-        {"Bucket": s3_object.bucket_name, "Key": s3_object.key},
-        ExtraArgs={
-            "ContentType": content_type,
-            "Metadata": metadata,
-            "MetadataDirective": "REPLACE",
-        },
-    )
+MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB
 
+def validate_content_type_and_magic_bytes(file_path, content_type):
+    """
+    Validate file content type by comparing magic bytes.
+    """
+    expected_magic_bytes = ALLOWED_CONTENT_TYPES.get(content_type.lower())
+    if not expected_magic_bytes:
+        return False
 
-def set_av_tags(s3_client, s3_object, scan_result, scan_signature, timestamp):
-    curr_tags = s3_client.get_object_tagging(
-        Bucket=s3_object.bucket_name, Key=s3_object.key
-    )["TagSet"]
-    new_tags = copy.copy(curr_tags)
-    for tag in curr_tags:
-        if tag["Key"] in [
-            AV_SIGNATURE_METADATA,
-            AV_STATUS_METADATA,
-            AV_TIMESTAMP_METADATA,
-        ]:
-            new_tags.remove(tag)
-    new_tags.append({"Key": AV_SIGNATURE_METADATA, "Value": scan_signature})
-    new_tags.append({"Key": AV_STATUS_METADATA, "Value": scan_result})
-    new_tags.append({"Key": AV_TIMESTAMP_METADATA, "Value": timestamp})
-    s3_client.put_object_tagging(
-        Bucket=s3_object.bucket_name, Key=s3_object.key, Tagging={"TagSet": new_tags}
-    )
+    # Read the file's magic bytes
+    with open(file_path, "rb") as f:
+        file_magic_bytes = list(f.read(len(expected_magic_bytes)))
 
-
-def sns_start_scan(sns_client, s3_object, scan_start_sns_arn, timestamp):
-    message = {
-        "bucket": s3_object.bucket_name,
-        "key": s3_object.key,
-        "version": s3_object.version_id,
-        AV_SCAN_START_METADATA: True,
-        AV_TIMESTAMP_METADATA: timestamp,
-    }
-    sns_client.publish(
-        TargetArn=scan_start_sns_arn,
-        Message=json.dumps({"default": json.dumps(message)}),
-        MessageStructure="json",
-    )
-
-
-def sns_scan_results(
-    sns_client, s3_object, sns_arn, scan_result, scan_signature, timestamp
-):
-    # Don't publish if scan_result is CLEAN and CLEAN results should not be published
-    if scan_result == AV_STATUS_CLEAN and not str_to_bool(AV_STATUS_SNS_PUBLISH_CLEAN):
-        return
-    # Don't publish if scan_result is INFECTED and INFECTED results should not be published
-    if scan_result == AV_STATUS_INFECTED and not str_to_bool(
-        AV_STATUS_SNS_PUBLISH_INFECTED
-    ):
-        return
-    message = {
-        "bucket": s3_object.bucket_name,
-        "key": s3_object.key,
-        "version": s3_object.version_id,
-        AV_SIGNATURE_METADATA: scan_signature,
-        AV_STATUS_METADATA: scan_result,
-        AV_TIMESTAMP_METADATA: get_timestamp(),
-    }
-    sns_client.publish(
-        TargetArn=sns_arn,
-        Message=json.dumps({"default": json.dumps(message)}),
-        MessageStructure="json",
-        MessageAttributes={
-            AV_STATUS_METADATA: {"DataType": "String", "StringValue": scan_result},
-            AV_SIGNATURE_METADATA: {
-                "DataType": "String",
-                "StringValue": scan_signature,
-            },
-        },
-    )
-
+    # Compare the file's magic bytes with the expected magic bytes
+    return file_magic_bytes == expected_magic_bytes
 
 def lambda_handler(event, context):
     try:
         # The rest of your lambda handler for POST request
-        s3 = boto3.resource("s3", endpoint_url=os.getenv("S3_ENDPOINT"))
-        s3_client = boto3.client("s3", endpoint_url=os.getenv("S3_ENDPOINT"))
+        s3 = boto3.resource("s3", endpoint_url=S3_ENDPOINT)
+        s3_client = boto3.client("s3", endpoint_url=S3_ENDPOINT)
 
         start_time = get_timestamp()
         print("Script starting at %s\n" % (start_time))
         print("Event:", event)
-        
-        body = json.loads(event["body"])
 
         # Check if the event contains base64-encoded file content
-        if "file_content" in body and "filename" in body:
+        if "base64" in event and "filename" in event and "content_type" in event:
             print("Processing file content directly from event payload.")
             # Decode file content and save it to /tmp
-            file_content = base64.b64decode(body["file_content"])
-            file_path = os.path.join("/tmp", body["filename"])
+            file_content = base64.b64decode(event["base64"])
+            file_path = os.path.join("/tmp", event["filename"])
             create_dir(os.path.dirname(file_path))
+
             with open(file_path, "wb") as f:
                 f.write(file_content)
 
+            # Validate file size
+            if len(file_content) > MAX_FILE_SIZE:
+                return {
+                    "statusCode": 400,
+                    "headers": {
+                        "Access-Control-Allow-Methods": "POST, OPTIONS",
+                        "Access-Control-Allow-Headers": "Content-Type",
+                    },
+                    "body": json.dumps({"error": "File size exceeds maximum limit"}),
+                }
+
+            # Validate content type and magic bytes
+            content_type = event["content_type"]
+            if content_type not in ALLOWED_CONTENT_TYPES:
+                return {
+                    "statusCode": 400,
+                    "headers": {
+                        "Access-Control-Allow-Methods": "POST, OPTIONS",
+                        "Access-Control-Allow-Headers": "Content-Type",
+                    },
+                    "body": json.dumps({"error": "Invalid content type"}),
+                }
+
+            if not validate_content_type_and_magic_bytes(file_path, content_type):
+                return {
+                    "statusCode": 400,
+                    "headers": {
+                        "Access-Control-Allow-Methods": "POST, OPTIONS",
+                        "Access-Control-Allow-Headers": "Content-Type",
+                    },
+                    "body": json.dumps({"error": "Content type and magic bytes do not match"}),
+                }
+
             # Update ClamAV definitions
             to_download = clamav.update_defs_from_s3(
-                s3_client, os.getenv("AV_DEFINITION_S3_BUCKET", ""),
-                os.getenv("AV_DEFINITION_S3_PREFIX", ""),
+                s3_client, AV_DEFINITION_S3_BUCKET, AV_DEFINITION_S3_PREFIX
             )
 
             for download in to_download.values():
@@ -238,10 +147,7 @@ def lambda_handler(event, context):
 
             # Scan the file
             scan_result, scan_signature = clamav.scan_file(file_path)
-            print(
-                "Scan of file %s resulted in %s\n"
-                % (file_path, scan_result)
-            )
+            print("Scan of file %s resulted in %s\n" % (file_path, scan_result))
 
             # Delete the file to free up space in /tmp
             try:
@@ -254,48 +160,39 @@ def lambda_handler(event, context):
 
             # Response with CORS headers
             return {
-                'statusCode': 200,
-                'headers': {
-                    'Access-Control-Allow-Methods': 'POST, OPTIONS',  # Methods allowed
-                    'Access-Control-Allow-Headers': 'Content-Type',  # Allowed headers
+                "statusCode": 200,
+                "headers": {
+                    "Access-Control-Allow-Methods": "POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "Content-Type",
                 },
-                'body': json.dumps({
-                    "scan_result": scan_result,
-                    "scan_signature": scan_signature,
-                    "timestamp": stop_scan_time,
-                })
+                "body": json.dumps(
+                    {
+                        "scan_result": scan_result,
+                        "scan_signature": scan_signature,
+                        "timestamp": stop_scan_time,
+                    }
+                ),
             }
         else:
-            print(f"Error occurred: Missing 'file_content' or 'filename' in the request body.")
+            print(f"Error occurred: Missing required fields in the request payload.")
             return {
-                'statusCode': 400,
-                'headers': {
-                    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-                    'Access-Control-Allow-Headers': 'Content-Type',
+                "statusCode": 400,
+                "headers": {
+                    "Access-Control-Allow-Methods": "POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "Content-Type",
                 },
-                'body': json.dumps({"error": "Invalid request payload"})
+                "body": json.dumps({"error": "Invalid request payload"}),
             }
-    except ValueError as e:
-        print(f"Invalid event: {e}")
-        return {
-            'statusCode': 400,
-            'headers': {
-                'Access-Control-Allow-Methods': 'POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type',
-            },
-            'body': json.dumps({"error": str(e)})
-        }
     except Exception as e:
         print(f"Error occurred: {e}")
         return {
-            'statusCode': 500,
-            'headers': {
-                'Access-Control-Allow-Methods': 'POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type',
+            "statusCode": 500,
+            "headers": {
+                "Access-Control-Allow-Methods": "POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type",
             },
-            'body': json.dumps({"error": str(e)})
+            "body": json.dumps({"error": str(e)}),
         }
-        
 def get_timestamp():
     # You can use any method to get the timestamp, e.g., time module
     from time import time
