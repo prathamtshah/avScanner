@@ -1,0 +1,115 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Bucket Antivirus Quickstart Template - avUpdateDefinitions resources only
+
+Resources:
+  IamRoleAVDefinitions:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AVDefinitionsLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Tags:
+        - Key: Service
+          Value: bucket-antivirus
+
+  IamPolicyAVDefinitions:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: AVDefinitionsLambdaPolicy
+      Roles:
+        - !Ref IamRoleAVDefinitions
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: WriteCloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: "*"
+          - Sid: S3GetAndPutWithTagging
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectTagging
+              - s3:PutObject
+              - s3:PutObjectTagging
+              - s3:PutObjectVersionTagging
+            Resource:
+              - !Sub
+                - arn:aws:s3:::${BucketName}/*
+                - BucketName: "antivirus-definitions-ruby"
+          - Sid: S3HeadObject
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource:
+              - !Sub
+                - arn:aws:s3:::${BucketName}/*
+                - BucketName: "antivirus-definitions-ruby"
+              - !Sub
+                - arn:aws:s3:::${BucketName}
+                - BucketName: "antivirus-definitions-ruby"
+
+  LambdaAVUpdateDefinitions:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: avUpdateDefinitions
+      Description: Lambda function to update the AntiVirus definitions in the AV
+        Definitions bucket.
+      Runtime: python3.10
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              return {
+                  'statusCode': 200, 'body': json.dumps('Hello from Lambda!')
+              }
+      Handler: update.lambda_handler
+      MemorySize: 1024
+      Timeout: 500
+      Role: !GetAtt IamRoleAVDefinitions.Arn
+      Environment:
+        Variables:
+          AV_DEFINITION_S3_BUCKET: antivirus-definitions-ruby
+      Tags:
+        - Key: Service
+          Value: bucket-antivirus
+
+  LambdaAVUpdateDefinitionsSchedule:
+    Type: AWS::Events::Rule
+    DependsOn:
+      - LambdaAVUpdateDefinitions
+    Properties:
+      Name: LambdaAVUpdateDefinitionsSchedule
+      Description: A schedule for the AV Update Definitions Lambda function.
+      ScheduleExpression: rate(3 hours)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaAVUpdateDefinitions.Arn
+          Id: LambdaAVUpdateDefinitionsSchedule
+
+  LambdaAVUpdateDefinitionsSchedulePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - LambdaAVUpdateDefinitionsSchedule
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaAVUpdateDefinitions.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LambdaAVUpdateDefinitionsSchedule.Arn
+
+Outputs:
+  LambdaAVUpdateDefinitions:
+    Value: !Ref LambdaAVUpdateDefinitions
+    Description: Lambda function to update the Antivirus Definitions in its
+      respective bucket

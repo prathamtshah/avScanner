@@ -43,23 +43,13 @@ RE_SEARCH_DIR = r"SEARCH_DIR\(\"=([A-z0-9\/\-_]*)\"\)"
 
 def current_library_search_path():
     try:
-        # Try to call ld to find the library search paths
-        ld_verbose = subprocess.check_output(["ld", "--verbose"]).decode("utf-8")
+        with open('ld_verbose_output.txt', 'r') as f:
+            ld_verbose = f.read()
         rd_ld = re.compile(RE_SEARCH_DIR)
         return rd_ld.findall(ld_verbose)
-    except FileNotFoundError:
-        print("Warning: 'ld' command not found. Falling back to default library search paths.")
-        return [
-            "/usr/lib",
-            "/bin",
-            "/opt/app/lib64",
-            "/opt/app/bin",
-            "/lib64",
-            "/usr/lib64",
-            "/opt/bin",       # Custom path for user-installed binaries
-            "/var/task/lib",  # Lambda deployment package libraries
-        ]
-
+    except:
+        # Fallback to default paths
+        return ["/var/lang/lib", "/var/runtime", "/lib64", "/usr/lib64","/var/task/lib","/opt/lib"]
 
 
 def update_defs_from_s3(s3_client, bucket, prefix):
@@ -126,17 +116,14 @@ def update_defs_from_freshclam(path, library_path=""):
     create_dir(path)
     fc_env = os.environ.copy()
     if library_path:
-        fc_env["LD_LIBRARY_PATH"] = "%s:%s" % (
-            ":".join(current_library_search_path()),
-            CLAMAVLIB_PATH,
-        )
+       fc_env["LD_LIBRARY_PATH"] = "/opt/layer/lib:/opt/layer/bin:" + fc_env.get("LD_LIBRARY_PATH", "")
     print("Starting freshclam with defs in %s." % path)
     fc_proc = subprocess.Popen(
         [
-            FRESHCLAM_PATH,
-            "--config-file=./bin/freshclam.conf",
-            "-u %s" % pwd.getpwuid(os.getuid())[0],
-            "--datadir=%s" % path,
+            "/opt/layer/bin/freshclam",
+            "--config-file=/opt/layer/etc/freshclam.conf",
+            "-u", pwd.getpwuid(os.getuid())[0],
+            f"--datadir={path}",
         ],
         stderr=subprocess.STDOUT,
         stdout=subprocess.PIPE,
