@@ -1,18 +1,3 @@
-# -*- coding: utf-8 -*-
-# Upside Travel, Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import base64
 import json
 import os
@@ -23,31 +8,10 @@ import boto3
 import clamav
 from common import AV_DEFINITION_S3_BUCKET
 from common import AV_DEFINITION_S3_PREFIX
-from common import AV_PROCESS_ORIGINAL_VERSION_ONLY
+from common import AV_QUARANTINE_S3_BUCKET
 from common import S3_ENDPOINT
 from common import create_dir
 from common import get_timestamp
-
-
-def verify_s3_object_version(s3, s3_object):
-    # validate that we only process the original version of a file, if asked to do so
-    # security check to disallow processing of a new (possibly infected) object version
-    # while a clean initial version is getting processed
-    # downstream services may consume latest version by mistake and get the infected version instead
-    bucket_versioning = s3.BucketVersioning(s3_object.bucket_name)
-    if bucket_versioning.status == "Enabled":
-        bucket = s3.Bucket(s3_object.bucket_name)
-        versions = list(bucket.object_versions.filter(Prefix=s3_object.key))
-        if len(versions) > 1:
-            raise Exception(
-                "Detected multiple object versions in %s.%s, aborting processing"
-                % (s3_object.bucket_name, s3_object.key)
-            )
-    else:
-        # misconfigured bucket, left with no or suspended versioning
-        raise Exception(
-            "Object versioning is not enabled in bucket %s" % s3_object.bucket_name
-        )
 
 
 def get_local_path(s3_object, local_prefix):
@@ -62,7 +26,7 @@ ALLOWED_CONTENT_TYPES = {
     "application/pdf": [0x25, 0x50, 0x44, 0x46],
 }
 
-MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 
 def validate_content_type_and_magic_bytes(file_path, content_type):
     """
@@ -81,7 +45,7 @@ def validate_content_type_and_magic_bytes(file_path, content_type):
 
 def lambda_handler(event, context):
     try:
-        # The rest of your lambda handler for POST request
+        # Initialize S3 resource and client
         s3 = boto3.resource("s3", endpoint_url=S3_ENDPOINT)
         s3_client = boto3.client("s3", endpoint_url=S3_ENDPOINT)
 
@@ -89,19 +53,23 @@ def lambda_handler(event, context):
         print("Script starting at %s\n" % (start_time))
         print("Event:", event)
 
-        # Check if the event contains base64-encoded file content
-        if "base64" in event and "filename" in event and "content_type" in event:
-            print("Processing file content directly from event payload.")
-            # Decode file content and save it to /tmp
-            file_content = base64.b64decode(event["base64"])
+        # Check if the event contains s3_key
+        if "s3_key" in event and "filename" in event and "content_type" in event:
+            print("Processing file from S3 bucket.")
+            
+            # Retrieve file details
+            s3_key = event["s3_key"]
             file_path = os.path.join("/tmp", event["filename"])
             create_dir(os.path.dirname(file_path))
 
-            with open(file_path, "wb") as f:
-                f.write(file_content)
+            # Download the file from S3
+            print(f"Downloading file from s3://{AV_QUARANTINE_S3_BUCKET}/{s3_key} to {file_path}")
+            s3.Bucket(AV_QUARANTINE_S3_BUCKET).download_file(s3_key, file_path)
+            print(f"File downloaded to {file_path}")
 
             # Validate file size
-            if len(file_content) > MAX_FILE_SIZE:
+            file_size = os.path.getsize(file_path)
+            if file_size > MAX_FILE_SIZE:
                 return {
                     "statusCode": 400,
                     "headers": {
@@ -193,6 +161,17 @@ def lambda_handler(event, context):
             },
             "body": json.dumps({"error": str(e)}),
         }
+    finally:
+          # Remove the file from the quarantine bucket
+        if "s3_key" in event:
+            s3_key = event["s3_key"]
+            try:
+                print(f"Removing file s3://{AV_QUARANTINE_S3_BUCKET}/{s3_key} from quarantine bucket.")
+                s3.Object(AV_QUARANTINE_S3_BUCKET, s3_key).delete()
+                print(f"File {s3_key} successfully removed from quarantine bucket.")
+            except Exception as e:
+                print(f"Error removing file {s3_key} from quarantine bucket: {e}")
+
 def get_timestamp():
     # You can use any method to get the timestamp, e.g., time module
     from time import time

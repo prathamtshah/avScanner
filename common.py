@@ -18,6 +18,7 @@ import datetime
 import os
 import os.path
 
+AV_QUARANTINE_S3_BUCKET = os.getenv("AV_QUARANTINE_S3_BUCKET","antivirus-quarantine-bucket-ruby")
 AV_DEFINITION_S3_BUCKET = os.getenv("AV_DEFINITION_S3_BUCKET")
 AV_DEFINITION_S3_PREFIX = os.getenv("AV_DEFINITION_S3_PREFIX", "clamav_defs")
 AV_DEFINITION_PATH = os.getenv("AV_DEFINITION_PATH", "/tmp/clamav_defs")
